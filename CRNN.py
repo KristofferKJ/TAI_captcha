@@ -7,6 +7,8 @@ from PIL import Image
 import numpy as np
 import matplotlib.pyplot as plt
 from tqdm import tqdm
+from torch.utils.tensorboard import SummaryWriter
+
 
 # Step 1: Define the alphabet and the label converter
 class LabelConverter:
@@ -41,24 +43,44 @@ class LabelConverter:
         return results
 
 # Step 2: Load the dataset
+print("Loading dataset from huggingface")
 ds = load_dataset("phunc20/nj_biergarten_captcha")
+print("Dataset loaded")
+
+#def extract_labels(dataset):
+#    return [''.join(key.split('_')[1:]).lower() for key in dataset["__key__"]]
+
+alphabet = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
+
+converter = LabelConverter(alphabet)
 
 def extract_labels(dataset):
-    return [''.join(key.split('_')[1:]).lower() for key in dataset["__key__"]]
+    # Extract the labels from the dataset
+    val = np.array(dataset.split("_")[1:])
+    return val
 
 class CustomCaptchaDataset(Dataset):
-    def __init__(self, dataset, transform=None):
+    #def __init__(self, dataset, transform=None):
+    def __init__(self, transform=None, alphabet=None, converter=None):
         self.transform = transform
-        self.dataset = dataset
-        self.image_files = [np.array(img) for img in dataset["jpg"]]
-        self.labels = extract_labels(dataset)
+        self.alphabet = alphabet
+        self.converter = converter
+        #self.dataset = dataset
+        #self.image_files = [np.array(img) for img in dataset["jpg"]]
+        #self.labels = extract_labels(dataset)
 
     def __len__(self):
-        return len(self.image_files)
+        return len(ds["train"])
 
     def __getitem__(self, idx):
-        image = self.image_files[idx]
-        label = self.labels[idx]
+        #image = self.image_files[idx]
+        image = np.array(ds["train"][idx]["jpg"])
+        #print("Image type:", type(image))
+        #label = self.labels[idx]
+        label = converter.encode(extract_labels(ds["train"][idx]["__key__"]))
+        #print("Label:", label)
+        #print("Label type:", type(label))
+
         if self.transform:
             image = self.transform(image)
         return image, label
@@ -66,12 +88,12 @@ class CustomCaptchaDataset(Dataset):
 # Step 3: Image transformation
 transform = transforms.Compose([
     transforms.ToPILImage(),
+    transforms.ToTensor(),
     transforms.Grayscale(),
     transforms.Resize((32, 128)),  # Standard size
     # Add augmentation for better generalization
     transforms.RandomRotation(2),  # Slight rotation
     transforms.RandomAffine(0, translate=(0.05, 0), scale=(0.95, 1.05)),  # Small translations/scaling
-    transforms.ToTensor(),
     transforms.Normalize((0.5,), (0.5,))  # Standard normalization
 ])
 
@@ -80,11 +102,13 @@ transform = transforms.Compose([
 data_points = 476118
 batch_size = 128
 
-dataset = CustomCaptchaDataset(ds["train"][:data_points], transform=transform)
+print("Creating dataset object...")
+dataset = CustomCaptchaDataset(transform=transform, alphabet=alphabet, converter=converter)
 train_size = int(data_points * 0.75)
 test_size = data_points - train_size
+print("Splitting dataset into train and test...")
 train_dataset, test_dataset = random_split(dataset, [train_size, test_size])
-
+print("Creating data loaders...")
 train_loader = DataLoader(train_dataset, batch_size=batch_size, shuffle=True)
 test_loader = DataLoader(test_dataset, batch_size=batch_size, shuffle=False)
 
@@ -122,23 +146,28 @@ class CRNN(nn.Module):
 
 # Step 6: Setup model, loss, optimizer
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-alphabet = ['1', '2', '3', '4', '5', '6', '7', '8', '9', 'a', 'b', 'c', 'd', 'e', 'f', 'g', 'h', 'i', 'j', 'k', 'l', 'm', 'n', 'o', 'p', 'q', 'r', 's', 't', 'u', 'v', 'w', 'x', 'y', 'z']
-converter = LabelConverter(alphabet)
+print(f"Using device: {device}")
 
+print("Creating model...")
 model = CRNN(32, 1, len(alphabet) + 1, 256).to(device)
+print("Model created")
+print("Creating loss function...")
 criterion = nn.CTCLoss(blank=0)
+print("Loss function created")
+print("Creating optimizer...")
 optimizer = torch.optim.Adam(model.parameters(), lr=0.0001)
+print("Optimizer created")
 
 # Add this right before your training loop
-print("Checking dataset labels...")
-sample_labels = [train_dataset[i][1] for i in range(min(10, len(train_dataset)))]
-print(f"Sample labels: {sample_labels}")
+#print("Checking dataset labels...")
+#sample_labels = [train_dataset[i][1] for i in range(min(10, len(train_dataset)))]
+#print(f"Sample labels: {sample_labels}")
 
 # Check if all characters exist in the alphabet
-all_chars = set(''.join(sample_labels))
-missing_chars = [c for c in all_chars if c not in alphabet]
-if missing_chars:
-    print(f"WARNING: These characters are in labels but not in alphabet: {missing_chars}")
+#all_chars = set(''.join(sample_labels))
+#missing_chars = [c for c in all_chars if c not in alphabet]
+#if missing_chars:
+#    print(f"WARNING: These characters are in labels but not in alphabet: {missing_chars}")
 
 # Step 7: Training loop
 # Training loop with progress bar and cleaner output
@@ -147,6 +176,11 @@ train_accuracies = []
 test_losses = []
 test_accuracies = []
 
+writer = SummaryWriter()
+total_batches = 0
+best_val_loss = float('inf')
+
+print("Starting training...")
 epochs = 20
 for epoch in range(epochs):
     model.train()
@@ -154,13 +188,24 @@ for epoch in range(epochs):
     correct = 0
     total = 0
     
+    total_train = 0
+    total_test = 0
+    step = 0
+
     # Add progress bar for training
     progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{epochs} [Train]")
     
     for images, texts in progress_bar:
+    #for batch_data in train_loader:
+        #images, texts = batch_data
+        step += 1
+
         images = images.to(device)
-        targets, target_lengths = converter.encode(texts)
+        #targets, target_lengths = converter.encode(texts)
+        targets = texts[0]
+        target_lengths = texts[1]
         targets = targets.to(device)
+        #targets = targets.to(torch.float32)
         target_lengths = target_lengths.to(device)
 
         preds = model(images)
@@ -177,18 +222,42 @@ for epoch in range(epochs):
         # Calculate accuracy during training
         with torch.no_grad():
             decoded_preds = converter.decode(preds_log_softmax, input_lengths)
-            for pred, true in zip(decoded_preds, texts):
-                if pred == true:
+            #print("Preds size:", len(decoded_preds))
+            #print("Preds", decoded_preds)
+            new_list = [converter.encode(decoded_preds[i])[0] for i in range(len(decoded_preds))]
+            #convert newlist to tensor and add to device
+            #print("Preds encoded", new_list)
+            #print("len preds encoded", len(converter.encode(decoded_preds)[0]))
+            #print("Targets size:", len(targets))
+            #print("Targets", targets)
+            for pred, true in zip(new_list, targets):
+                pred = pred.to(device)
+                #print("Pred:", pred)
+                #print("True:", true)
+                #if pred == true:
+                #if (np.all(torch.eq(pred, true))):
+                #    correct += 1
+                # Check if the predicted and true tensors are equal, beware of the tensors having different shapes
+                if pred.shape == true.shape and torch.all(pred == true):
                     correct += 1
-            total += len(texts)
+            #print("correct:", correct)
+            total += len(targets)
+            #print("total:", total)
         
         # Update progress bar with current loss
         train_acc = 100 * correct / total if total > 0 else 0
         progress_bar.set_postfix(loss=f"{total_loss/len(progress_bar):.4f}", accuracy=f"{train_acc:.2f}%")
+
+        # Log loss and accuracy to TensorBoard for total batches
+        total_batches += 1
+        writer.add_scalar('Total batches', total_loss/(step), total_batches)
     
     avg_train_loss = total_loss / len(train_loader)
     train_accuracy = 100 * correct / total if total > 0 else 0
     
+    writer.add_scalar('Train Loss', avg_train_loss, epoch)
+    writer.add_scalar('Train Accuracy', train_accuracy, epoch)
+
     epoch_losses.append(avg_train_loss)
     train_accuracies.append(train_accuracy)
     
@@ -204,7 +273,9 @@ for epoch in range(epochs):
     with torch.no_grad():
         for images, texts in progress_bar:
             images = images.to(device)
-            targets, target_lengths = converter.encode(texts)
+            #targets, target_lengths = converter.encode(texts)
+            targets = texts[0]
+            target_lengths = texts[1]
             targets = targets.to(device)
             target_lengths = target_lengths.to(device)
             
@@ -217,10 +288,21 @@ for epoch in range(epochs):
             val_loss += loss.item()
             
             decoded_preds = converter.decode(preds_log_softmax, input_lengths)
-            for pred, true in zip(decoded_preds, texts):
-                if pred == true:
+            new_list = [converter.encode(decoded_preds[i])[0] for i in range(len(decoded_preds))]
+
+            #for pred, true in zip(decoded_preds, texts):
+            #    if pred == true:
+            #        correct += 1
+            for pred, true in zip(new_list, targets):
+                pred = pred.to(device)
+                print("Pred:", pred)
+                print("True:", true)
+            
+                if pred.shape == true.shape and torch.all(pred == true):
                     correct += 1
-            total += len(texts)
+            
+            print("correct:", correct)
+            total += len(targets)
             
             # Update progress bar
             val_acc = 100 * correct / total if total > 0 else 0
@@ -231,6 +313,15 @@ for epoch in range(epochs):
     
     test_losses.append(avg_val_loss)
     test_accuracies.append(val_accuracy)
+
+    writer.add_scalar('Validation Loss', avg_val_loss, epoch)
+    writer.add_scalar('Validation Accuracy', val_accuracy, epoch)
+
+    if avg_val_loss < best_val_loss:
+        best_val_loss = avg_val_loss
+        # Save the model if validation loss improves
+        torch.save(model.state_dict(), 'best_model.pth')
+        print(f"Model saved at epoch {epoch+1} with validation loss: {avg_val_loss:.4f}")
     
     # Print one simple line with all metrics for this epoch
     print(f"Epoch {epoch+1}/{epochs} - Train Loss: {avg_train_loss:.4f}, Train Acc: {train_accuracy:.2f}%, Val Loss: {avg_val_loss:.4f}, Val Acc: {val_accuracy:.2f}%")
